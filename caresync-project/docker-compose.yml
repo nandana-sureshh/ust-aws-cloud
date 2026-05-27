@@ -1,0 +1,205 @@
+# ── CareSync Production Stack ─────────────────────────────────────────────────
+# Single docker-compose.yml used for ALL tiers (Frontend ASG + Backend ASG).
+#
+# Frontend ASG — runs ONLY:
+#   docker compose up -d frontend
+#
+# Backend ASG — runs ONLY:
+#   docker compose up -d auth-service patient-service doctor-service appointment-service
+#
+# MongoDB — runs ONLY on dedicated DB EC2 (or standalone):
+#   docker compose up -d mongo
+#   → Will later move to a dedicated EC2 outside compose entirely.
+#     Simply update MONGO_URI env vars — zero code changes required.
+#
+# Architecture:
+#   Internet → External ALB → Frontend ASG (nginx on :8080)
+#                           → nginx proxies /api/* → Internal ALB
+#                                                  → Backend ASG (:4001-4004)
+#                                                  → MongoDB EC2 (:27017)
+#
+# Key runtime variables (inject via EC2 User Data / ASG Launch Template):
+#   INTERNAL_ALB_DNS  — DNS of the Internal ALB (e.g. internal-xyz.elb.amazonaws.com)
+#   ALLOWED_ORIGINS   — External ALB DNS for browser CORS (e.g. http://external-xyz.elb.amazonaws.com)
+#   JWT_SECRET        — Strong random secret (pull from AWS Secrets Manager / SSM)
+#   MONGO_URI         — MongoDB connection string (update when DB moves to dedicated EC2)
+# ─────────────────────────────────────────────────────────────────────────────
+
+version: "3.9"
+
+networks:
+  caresync-net:
+    driver: bridge
+
+volumes:
+  mongo-data:
+    driver: local
+
+services:
+
+  # ── Shared MongoDB ──────────────────────────────────────────────────────────
+  # Single MongoDB instance with 4 logical databases:
+  #   authdb | patientdb | doctordb | appointmentdb
+  #
+  # NOTE: No host port mapping — MongoDB is NOT exposed outside the container
+  # network. Only backend services on caresync-net can reach it via Docker DNS.
+  # When migrating to a dedicated EC2, remove this service entirely and update
+  # MONGO_URI in each backend service to point to the EC2 private IP.
+  mongo:
+    image: mongo:7
+    container_name: caresync-mongo
+    restart: unless-stopped
+    networks:
+      - caresync-net
+    volumes:
+      - mongo-data:/data/db
+    # ── Port 27017 intentionally NOT exposed to the host ──────────────────────
+    # Backend services connect via Docker bridge DNS: mongodb://mongo:27017/
+    # Remove the 'ports:' block entirely for production security.
+    healthcheck:
+      test: ["CMD", "mongosh", "--eval", "db.adminCommand('ping')"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+
+  # ── Auth Service ────────────────────────────────────────────────────────────
+  auth-service:
+    build:
+      context: ./services/auth-service
+      dockerfile: Dockerfile
+    container_name: caresync-auth
+    restart: unless-stopped
+    networks:
+      - caresync-net
+    ports:
+      - "4001:4001"
+    environment:
+      PORT: "4001"
+      NODE_ENV: production
+      MONGO_URI: mongodb://10.1.31.35:27017/authdb
+      JWT_SECRET: ${JWT_SECRET:-change_this_to_a_strong_random_secret_in_production}
+      JWT_EXPIRES_IN: "7d"
+      # Comma-separated list of allowed browser origins.
+      # Set to your External ALB DNS on production EC2 instances.
+      # Example: ALLOWED_ORIGINS=http://external-caresync-alb-xyz.us-east-1.elb.amazonaws.com
+      ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:-http://localhost:8080}
+   
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:4001/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+
+  # ── Patient Service ─────────────────────────────────────────────────────────
+  patient-service:
+    build:
+      context: ./services/patient-service
+      dockerfile: Dockerfile
+    container_name: caresync-patient
+    restart: unless-stopped
+    networks:
+      - caresync-net
+    ports:
+      - "4002:4002"
+    environment:
+      PORT: "4002"
+      NODE_ENV: production
+      MONGO_URI: mongodb://10.1.31.35:27017/patientdb
+      JWT_SECRET: ${JWT_SECRET:-change_this_to_a_strong_random_secret_in_production}
+      AUTH_SERVICE_URL: http://auth-service:4001
+      ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:-http://localhost:8080}
+    
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:4002/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+
+  # ── Doctor Service ──────────────────────────────────────────────────────────
+  doctor-service:
+    build:
+      context: ./services/doctor-service
+      dockerfile: Dockerfile
+    container_name: caresync-doctor
+    restart: unless-stopped
+    networks:
+      - caresync-net
+    ports:
+      - "4003:4003"
+    environment:
+      PORT: "4003"
+      NODE_ENV: production
+      MONGO_URI: mongodb://10.1.31.35:27017/doctordb
+      JWT_SECRET: ${JWT_SECRET:-change_this_to_a_strong_random_secret_in_production}
+      AUTH_SERVICE_URL: http://auth-service:4001
+      ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:-http://localhost:8080}
+   
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:4003/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+
+  # ── Appointment Service ─────────────────────────────────────────────────────
+  appointment-service:
+    build:
+      context: ./services/appointment-service
+      dockerfile: Dockerfile
+    container_name: caresync-appointment
+    restart: unless-stopped
+    networks:
+      - caresync-net
+    ports:
+      - "4004:4004"
+    environment:
+      PORT: "4004"
+      NODE_ENV: production
+      MONGO_URI: mongodb://10.1.31.35:27017/appointmentdb
+      JWT_SECRET: ${JWT_SECRET:-change_this_to_a_strong_random_secret_in_production}
+      AUTH_SERVICE_URL: http://auth-service:4001
+      PATIENT_SERVICE_URL: http://patient-service:4002
+      DOCTOR_SERVICE_URL: http://doctor-service:4003
+      ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:-http://localhost:8080}
+    
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:4004/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+
+  # ── Frontend ────────────────────────────────────────────────────────────────
+  # Serves the React SPA via nginx on port 8080.
+  # nginx proxies /api/* requests to the Internal ALB (INTERNAL_ALB_DNS).
+  # No build-time REACT_APP_* args needed — frontend uses relative API paths.
+  #
+  # INTERNAL_ALB_DNS must be set before running 'docker compose up -d frontend'.
+  # Set it in the EC2 environment or export it in the ASG User Data script:
+  #   export INTERNAL_ALB_DNS=internal-caresync-alb-xyz.us-east-1.elb.amazonaws.com
+  frontend:
+    build:
+      context: ./services/frontend
+      dockerfile: Dockerfile
+    container_name: caresync-frontend
+    restart: unless-stopped
+    networks:
+      - caresync-net
+    ports:
+      - "8080:8080"
+    environment:
+      # Runtime variable — injected into nginx.conf by envsubst at container start.
+      # Must be the DNS hostname of the Internal ALB (without http:// prefix).
+      INTERNAL_ALB_DNS: ${INTERNAL_ALB_DNS:-internal-in-alb-2012640406.us-east-1.elb.amazonaws.com}
+    # No depends_on — Frontend ASG runs 'docker compose up -d frontend' in isolation.
+    # Backend services run on a separate Backend ASG behind the Internal ALB.
+    # nginx proxies /api/* to INTERNAL_ALB_DNS; no Docker bridge dependency needed.
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q --spider http://localhost:8080/ || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
